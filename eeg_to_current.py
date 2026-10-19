@@ -59,7 +59,17 @@ def load_demo():
 def band_powers(raw):
     """Returns (stages, powers) with powers shaped (n_epochs, n_bands), in uV^2."""
     raw.filter(0.5, 30.0, verbose=False)
-    events, event_id = mne.events_from_annotations(raw, chunk_duration=EPOCH_S, verbose=False)
+    # Sleep-EDF scores W, 1, 2, 3, 4, R, plus "?" (unscored) and "Movement time".
+    # Keep the real stages only; fold 4 into 3 (the modern convention).
+    wanted = {"Sleep stage W": 0, "Sleep stage 1": 1, "Sleep stage 2": 2,
+              "Sleep stage 3": 3, "Sleep stage 4": 3, "Sleep stage R": 4}
+    keep = [i for i, d in enumerate(raw.annotations.description) if d in wanted]
+    raw.set_annotations(raw.annotations[keep])
+    events, _ = mne.events_from_annotations(raw, event_id=wanted,
+                                            chunk_duration=EPOCH_S, verbose=False)
+    present = sorted(set(events[:, 2]))
+    names = {0: "W", 1: "1", 2: "2", 3: "3", 4: "R"}
+    event_id = {names[c]: c for c in present}
     epochs = mne.Epochs(raw, events, event_id, tmin=0.0, tmax=EPOCH_S - 1.0 / raw.info["sfreq"],
                         baseline=None, preload=True, verbose=False)
     psd = epochs.compute_psd(fmin=0.5, fmax=30.0, verbose=False)
@@ -68,8 +78,7 @@ def band_powers(raw):
     powers = np.column_stack([
         spectra[:, (freqs >= lo) & (freqs < hi)].mean(axis=1) for lo, hi in BANDS.values()
     ])
-    inv = {v: k for k, v in event_id.items()}
-    stages = [inv[e].replace("Sleep stage ", "") for e in epochs.events[:, 2]]
+    stages = [names[e] for e in epochs.events[:, 2]]
     return stages, powers
 
 

@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 V_REST = -70.0      # mV, where the neuron sits when left alone
 V_THRESH = -55.0    # mV, firing threshold
 V_RESET = -75.0     # mV, where it drops to after a spike
-TAU_M = 20.0        # ms, membrane time constant (how fast the leak drains)
+TAU_M =    20.0     # ms, membrane time constant (how fast the leak drains)
 R_M = 10.0          # MOhm, membrane resistance (how strongly current moves V)
 T_REF = 2.0         # ms, refractory period after a spike (ignores input)
 
@@ -51,7 +51,7 @@ def tap(t):                       # one short press: a 5 ms pulse
     return 8.0 if 100 <= t < 105 else 0.0
 
 def hold(t):                      # finger held down: sustained current
-    return 2.0 if 100 <= t < 400 else 0.0
+    return 4.0 if 100 <= t < 400 else 0.0
 
 def hold_with_noise(t):           # held down while the device is shaken
     return (2.0 if 100 <= t < 400 else 0.0) + np.random.normal(0, 1.5)
