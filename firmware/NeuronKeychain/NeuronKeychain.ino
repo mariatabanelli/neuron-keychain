@@ -206,6 +206,10 @@ void renderHome(float batteryV, bool shaking) {
   else if (millis() < extCurrentUntil) { snprintf(buf, sizeof(buf), "EEG %.1f", extCurrent); gfx->print(buf); }
   else gfx->print(" rest");
   if (stageLabel[0] && millis() < extCurrentUntil) { gfx->setTextSize(2); gfx->setCursor(CX - 6, CY + 84); gfx->print(stageLabel); }
+  // debug: raw shake metric and last accel sample
+  gfx->setTextSize(1); gfx->setTextColor(gfx->color565(90, 90, 90));
+  snprintf(buf, sizeof(buf), "sh %.2f", shake); gfx->setCursor(CX - 56, CY + 90); gfx->print(buf);
+  snprintf(buf, sizeof(buf), "a %.1f", fabsf(accPrev[0]) + fabsf(accPrev[1]) + fabsf(accPrev[2])); gfx->setCursor(CX + 8, CY + 90); gfx->print(buf);
   drawStatusDots(batteryV);
   gfx->flush();
 }
@@ -232,6 +236,10 @@ void renderParams(float batteryV) {
   gfx->setTextSize(1); gfx->setTextColor(gfx->color565(140, 140, 140));
   gfx->setCursor(CX - 3 * strlen(p.unit), CY + 26); gfx->print(p.unit);
   gfx->setCursor(CX - 54, CY + 48); gfx->print("drag up/down  tap=next");
+  if (wifiWanted) {
+    gfx->setCursor(CX - 45, CY + 66);
+    if (WiFi.status() == WL_CONNECTED) gfx->print(WiFi.localIP().toString()); else gfx->print("wifi connecting...");
+  }
   drawStatusDots(batteryV);
   gfx->flush();
 }
@@ -288,14 +296,18 @@ void loop() {
 
   // ---- sensors / network ----
   readShake();
-  bool shaking = shake > 1.5f;              // acc is in m/s^2; rest jitter is well under 1
-  if (wifiWanted) oscReceive();
+  bool shaking = shake > 150.0f;            // measured: rest ~8, vigorous shake ~2000 (raw IMU scale, ~1340 per g)
+  if (wifiWanted) {
+    static bool announced = false;
+    if (WiFi.status() == WL_CONNECTED && !announced) { announced = true; Serial.print("IP "); Serial.println(WiFi.localIP()); }
+    oscReceive();
+  }
   if (now > extCurrentUntil) extCurrent = 0;
 
   // ---- model ----
   uint32_t elapsed = now - lastFrame; if (elapsed > 50) elapsed = 50; lastFrame = now;
   int steps = (int)(elapsed / DT);
-  float sigma = shaking ? SHAKE_GAIN * shake * 0.3f : 0.0f; if (sigma > 3.0f) sigma = 3.0f;
+  float sigma = shaking ? SHAKE_GAIN * shake / 600.0f : 0.0f; if (sigma > 3.0f) sigma = 3.0f;   // 600 -> 1 nA, 1800+ -> 3 nA
   spikeThisFrame = false;
   for (int s = 0; s < steps; s++) {
     float iIn = extCurrent;
