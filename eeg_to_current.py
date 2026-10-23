@@ -117,14 +117,18 @@ def plot(stages, powers, current, out="eeg_to_current.png"):
     print(f"saved {out}")
 
 
+STAGE_INDEX = {"W": 0, "1": 1, "2": 2, "3": 3, "R": 4}
+
 def stream_osc(stages, current, host="127.0.0.1", port=9000, speed=600.0):
-    """Replay the night over OSC. speed=600 means 10 min of sleep per second."""
+    """Replay the night over OSC. speed=600 means 10 min of sleep per second.
+    Sends /neuron/current (float nA) and /neuron/stage (int 0..4 = W,1,2,3,R)."""
     from pythonosc.udp_client import SimpleUDPClient
     client = SimpleUDPClient(host, port)
     dt = EPOCH_S / speed
+    print(f"streaming {len(stages)} epochs to {host}:{port} at {speed:.0f}x ({len(stages)*dt:.0f} s)")
     for s, i in zip(stages, current):
         client.send_message("/neuron/current", float(i))
-        client.send_message("/neuron/stage", s)
+        client.send_message("/neuron/stage", STAGE_INDEX.get(s, 0))
         time.sleep(dt)
 
 
@@ -132,10 +136,19 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true", help="synthetic data, no download")
     ap.add_argument("--osc", action="store_true", help="stream over OSC after plotting")
+    ap.add_argument("--host", default="127.0.0.1", help="OSC target: 127.0.0.1 for TouchDesigner, or the keychain's IP")
+    ap.add_argument("--port", type=int, default=9000, help="9000 for TouchDesigner, 9001 for the keychain")
+    ap.add_argument("--speed", type=float, default=600.0, help="replay speed; 600 = 10 min of sleep per second, 60 = 1 min/s")
+    ap.add_argument("--sleep-only", action="store_true", help="crop to 30 min before sleep onset .. 30 min after final wake")
     args = ap.parse_args()
 
     raw = load_demo() if args.demo else load_sleep_edf()
     stages, powers = band_powers(raw)
+    if args.sleep_only:
+        asleep = [i for i, st in enumerate(stages) if st != "W"]
+        if asleep:
+            lo, hi = max(0, asleep[0] - 60), min(len(stages), asleep[-1] + 60)   # 60 epochs = 30 min
+            stages, powers = stages[lo:hi], powers[lo:hi]
     current = to_current(powers)
     print(f"{len(stages)} epochs, {len(stages) * EPOCH_S / 3600:.1f} h, "
           f"current range {current.min():.2f} to {current.max():.2f} nA")
@@ -143,4 +156,4 @@ if __name__ == "__main__":
                header="stage,current_nA", comments="")
     plot(stages, powers, current)
     if args.osc:
-        stream_osc(stages, current)
+        stream_osc(stages, current, host=args.host, port=args.port, speed=args.speed)
