@@ -1,5 +1,5 @@
 /*
-  Neuron keychain, firmware v0.2
+  Neuron keychain, firmware v0.3 (1-bit paper-and-ink look)
   Board : Waveshare ESP32-S3-Touch-LCD-1.28 (GC9A01 round 240x240, CST816S touch, QMI8658 IMU)
   Core  : esp32 by Espressif 3.1.x   Libs: GFX Library for Arduino (moononournation)
   Settings: ESP32S3 Dev Module, USB CDC On Boot Enabled, Flash 16MB, PSRAM QSPI, Partition 16M (3MB APP)
@@ -19,6 +19,7 @@
 #include "CST816S.h"
 #include "QMI8658.h"
 #include "secrets.h"
+#include "brain_bitmap.h"
 
 // ---------------- pins ----------------
 #define PIN_BL 2
@@ -113,6 +114,9 @@ float gaussNoise() {               // approx N(0,1): sum of 4 uniforms
 WiFiUDP udp;
 bool wifiWanted = strcmp(WIFI_SSID, "your-wifi-name") != 0;
 float extCurrent = 0; uint32_t extCurrentUntil = 0;
+// incoming current history for the EEG strip (one value per received message)
+#define N_EXT 96
+float extHist[N_EXT]; int extHead = 0; bool extHistValid = false;
 char stageLabel[4] = "";
 uint8_t oscBuf[256];
 
@@ -138,6 +142,7 @@ void oscReceive() {
     if (!strcmp(addr, "/neuron/current") && tags[1] == 'f') {
       uint32_t u = ((uint32_t)arg[0] << 24) | ((uint32_t)arg[1] << 16) | ((uint32_t)arg[2] << 8) | arg[3];
       memcpy(&extCurrent, &u, 4); extCurrentUntil = millis() + 5000;
+      extHist[extHead] = extCurrent; extHead = (extHead + 1) % N_EXT; extHistValid = true;
     } else if (!strcmp(addr, "/neuron/stage")) {
       if (tags[1] == 's') { strncpy(stageLabel, (const char *)arg, 3); stageLabel[3] = 0; }
       else if (tags[1] == 'i') { int s = arg[3]; const char *names[] = {"W", "1", "2", "3", "R"}; strcpy(stageLabel, s >= 0 && s < 5 ? names[s] : "?"); }
@@ -166,78 +171,129 @@ void stepModel(float iIn) {
 // ---------------- drawing ----------------
 const int CX = 120, CY = 120;
 const float R_MIN = 62.0f, R_MAX = 108.0f;
+
+// ---- palette (1-bit look: paper + ink) ----
+#define C_PAPER  (gfx->color565(196, 242, 176))   // pale mint
+#define C_INK    (gfx->color565(18, 24, 18))      // near black
+#define C_INK_LT (gfx->color565(110, 150, 100))   // dotted lines
+
+
+// stippled line: draws every other pixel along the segment
+void dotLine(float x0, float y0, float x1, float y1, uint16_t col, int phase) {
+  float dx = x1 - x0, dy = y1 - y0; int n = (int)fmaxf(fabsf(dx), fabsf(dy)); if (n < 1) n = 1;
+  for (int i = 0; i <= n; i++) if (((i + phase) & 1) == 0) gfx->drawPixel((int)(x0 + dx * i / n), (int)(y0 + dy * i / n), col);
+}
 float vToR(float mv) { float t = (mv - V_RESET) / (20.0f - V_RESET); if (t < 0) t = 0; if (t > 1) t = 1; return R_MIN + t * (R_MAX - R_MIN); }
-void drawDashedCircle(float r, uint16_t col) {
-  for (int a = 0; a < 360; a += 6) { float a0 = a * DEG_TO_RAD, a1 = (a + 3) * DEG_TO_RAD;
-    gfx->drawLine(CX + cosf(a0) * r, CY + sinf(a0) * r, CX + cosf(a1) * r, CY + sinf(a1) * r, col); }
+void drawDashedCircle(float r, uint16_t col) {   // dotted: one pixel every 3 degrees
+  for (int a = 0; a < 360; a += 3) { float a0 = a * DEG_TO_RAD; gfx->drawPixel(CX + cosf(a0) * r, CY + sinf(a0) * r, col); }
 }
 void drawStatusDots(float batteryV) {
   char buf[16];
-  gfx->setTextSize(1); gfx->setTextColor(gfx->color565(140, 140, 140));
-  gfx->setCursor(CX - 14, 26);
+  gfx->setTextSize(1); gfx->setTextColor(C_INK_LT);
+  gfx->setCursor(CX - 14, 44);
   if (batteryV > 2.5f) { snprintf(buf, sizeof(buf), "%.2fV", batteryV); gfx->print(buf); } else gfx->print("USB");
-  if (wifiWanted) gfx->fillCircle(CX + 30, 29, 3, WiFi.status() == WL_CONNECTED ? gfx->color565(60, 220, 120) : gfx->color565(120, 60, 60));
-  if (imuOk) gfx->fillCircle(CX - 30, 29, 3, gfx->color565(60, 120, 220));
+  if (wifiWanted) { if (WiFi.status() == WL_CONNECTED) gfx->fillCircle(CX + 30, 47, 2, C_INK); else gfx->drawCircle(CX + 30, 47, 2, C_INK_LT); }
+  if (imuOk) gfx->fillCircle(CX - 30, 47, 2, C_INK_LT);
 }
 
 void renderHome(float batteryV, bool shaking) {
-  gfx->fillScreen(RGB565_BLACK);
-  if (flash > 0.01f) { uint8_t g = (uint8_t)(flash * 90); gfx->fillCircle(CX, CY, 118, gfx->color565(g, g / 3, g)); gfx->fillCircle(CX, CY, 112, RGB565_BLACK); }
-  gfx->drawCircle(CX, CY, (int)vToR(V_REST), gfx->color565(40, 40, 40));
-  drawDashedCircle(vToR(V_THRESH), gfx->color565(110, 110, 110));
-  int px = 0, py = 0;
-  for (int i = 0; i < N_TRACE; i++) {
-    int idx = (traceHead + i) % N_TRACE; float ang = (-90.0f + i) * DEG_TO_RAD; float r = vToR(trace[idx]);
-    int x = CX + cosf(ang) * r, y = CY + sinf(ang) * r;
-    if (i > 0) { uint8_t b = 60 + (uint8_t)(195.0f * i / N_TRACE);
-      gfx->drawLine(px, py, x, y, trace[idx] > V_THRESH ? gfx->color565(255, 120, 255) : gfx->color565(b, b, b)); }
-    px = x; py = y;
+  bool eegMode = millis() < extCurrentUntil;
+  gfx->fillScreen(C_PAPER);
+
+  // spike bloom: halftone ring at the rim, fades with flash
+  if (flash > 0.05f) {
+    int rr = 110 + (int)(8 * (1 - flash));
+    for (int a = 0; a < 360; a += 2) { float a0 = a * DEG_TO_RAD;
+      for (int r = rr; r < 118; r += 2) if (((a / 2 + r) & 1) == 0 && (float)random(0, 100) < flash * 100) gfx->drawPixel(CX + cosf(a0) * r, CY + sinf(a0) * r, C_INK); }
   }
-  char buf[16];
-  gfx->setTextColor(RGB565_WHITE); gfx->setTextSize(3);
-  snprintf(buf, sizeof(buf), "%4.0f", v > V_THRESH ? V_THRESH : v); gfx->setCursor(CX - 36, CY - 22); gfx->print(buf);
-  gfx->setTextSize(1);
-  gfx->setCursor(CX - 8, CY + 6); gfx->print("mV");
-  gfx->setCursor(CX - 30, CY + 24); gfx->print("spikes "); gfx->print(spikeCount);
-  gfx->setCursor(CX - 24, CY + 64);
-  if (millis() < tapShownUntil && !fingerDown) gfx->print(" TAP ");
-  else if (fingerDown) gfx->print(" HOLD");
-  else if (shaking) gfx->print("SHAKE");
-  else if (millis() < extCurrentUntil) { snprintf(buf, sizeof(buf), "EEG %.1f", extCurrent); gfx->print(buf); }
-  else gfx->print(" rest");
-  if (stageLabel[0] && millis() < extCurrentUntil) { gfx->setTextSize(2); gfx->setCursor(CX - 6, CY + 84); gfx->print(stageLabel); }
-  // debug: raw shake metric and last accel sample
-  gfx->setTextSize(1); gfx->setTextColor(gfx->color565(90, 90, 90));
-  snprintf(buf, sizeof(buf), "sh %.2f", shake); gfx->setCursor(CX - 56, CY + 90); gfx->print(buf);
-  snprintf(buf, sizeof(buf), "a %.1f", fabsf(accPrev[0]) + fabsf(accPrev[1]) + fabsf(accPrev[2])); gfx->setCursor(CX + 8, CY + 90); gfx->print(buf);
+
+  // rest baseline (faint) and threshold (dotted)
+  drawDashedCircle(vToR(V_THRESH), C_INK);
+  float rRest = vToR(V_REST);
+
+  // membrane trace as a halftone band: radial stipple from rest radius to the voltage, outline dot at the tip
+  float pxp = 0, pyp = 0;
+  for (int i = 0; i < N_TRACE; i++) {
+    int idx = (traceHead + i) % N_TRACE; float ang = (-90.0f + i) * DEG_TO_RAD;
+    float r = vToR(trace[idx]);
+    float ca = cosf(ang), sa = sinf(ang);
+    float x = CX + ca * r, y = CY + sa * r;
+    bool spike = trace[idx] > V_THRESH;
+    int phase = (i + (int)(millis() / 120)) & 1;             // slow shimmer in the halftone
+    if (spike) gfx->drawLine(CX + ca * rRest, CY + sa * rRest, x, y, C_INK);   // spikes solid
+    else if (i > N_TRACE - 300) dotLine(CX + ca * rRest, CY + sa * rRest, x, y, C_INK, phase);  // newer part dense
+    else if ((i & 1) == 0) dotLine(CX + ca * rRest, CY + sa * rRest, x, y, C_INK, phase);        // oldest part sparse
+    if (i > 0) gfx->drawLine(pxp, pyp, x, y, C_INK);           // outline
+    pxp = x; pyp = y;
+  }
+
+  char buf[20];
+  gfx->setTextColor(C_INK);
+  if (!eegMode) {
+    gfx->setTextSize(4);
+    snprintf(buf, sizeof(buf), "%d", (int)roundf(v > V_THRESH ? V_THRESH : v));
+    gfx->setCursor(CX - 12 * strlen(buf), CY - 26); gfx->print(buf);
+    gfx->setTextSize(1);
+    gfx->setCursor(CX - 6, CY + 8); gfx->print("mV");
+    snprintf(buf, sizeof(buf), "spikes %lu", (unsigned long)spikeCount);
+    gfx->setCursor(CX - 3 * strlen(buf), CY + 24); gfx->print(buf);
+    gfx->setCursor(CX - 15, CY + 60);
+    if (millis() < tapShownUntil && !fingerDown) gfx->print(" tap ");
+    else if (fingerDown) gfx->print(" hold");
+    else if (shaking) gfx->print("shake");
+  } else {
+    // EEG mode: faint dithered brain behind, the recording's current as a strip, label, stage letter
+    gfx->drawBitmap(CX - BRAIN_W / 2, CY - BRAIN_H / 2 - 6, BRAIN_BITS, BRAIN_W, BRAIN_H, C_INK_LT);
+    int x0 = CX - 48, w = 96, yMid = CY - 14, h = 22;
+    gfx->fillRect(x0 - 4, yMid - h / 2 - 3, w + 8, h + 6, C_PAPER);     // clear a window for the strip
+    if (extHistValid) {
+      float py = 0;
+      for (int i = 0; i < N_EXT; i++) {
+        int idx = (extHead + i) % N_EXT; float val = extHist[idx]; if (val < 0) val = 0; if (val > 4) val = 4;
+        float x = x0 + (float)w * i / (N_EXT - 1), y = yMid + h / 2 - (val / 4.0f) * h;
+        if (i > 0) gfx->drawLine(x0 + (float)w * (i - 1) / (N_EXT - 1), py, x, y, C_INK);
+        py = y;
+      }
+    }
+    gfx->setTextSize(1);
+    snprintf(buf, sizeof(buf), "EEG %.1f", extCurrent);
+    gfx->setCursor(CX - 3 * strlen(buf), CY + 4); gfx->print(buf);
+    gfx->setTextSize(4);
+    gfx->setCursor(CX - 12, CY + 30); gfx->print(stageLabel[0] ? stageLabel : "?");
+    gfx->setTextSize(1);
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)spikeCount);
+    gfx->setCursor(CX - 3 * strlen(buf), CY + 66); gfx->print(buf);
+  }
+
   drawStatusDots(batteryV);
   gfx->flush();
 }
 
 void renderParams(float batteryV) {
-  gfx->fillScreen(RGB565_BLACK);
+  gfx->fillScreen(C_PAPER);
+  drawDashedCircle(104, C_INK_LT);
   // six ticks around the ring, selected one bright
   for (int i = 0; i < N_PARAMS; i++) {
     float a = (-90.0f + i * 60.0f) * DEG_TO_RAD;
     int x = CX + cosf(a) * 96, y = CY + sinf(a) * 96;
     bool sel = i == selParam;
-    gfx->fillCircle(x, y, sel ? 6 : 3, sel ? gfx->color565(255, 120, 255) : gfx->color565(90, 90, 90));
-    gfx->setTextSize(1); gfx->setTextColor(sel ? RGB565_WHITE : gfx->color565(120, 120, 120));
+    if (sel) gfx->fillCircle(x, y, 5, C_INK); else gfx->drawCircle(x, y, 3, C_INK);
+    gfx->setTextSize(1); gfx->setTextColor(sel ? C_INK : C_INK_LT);
     gfx->setCursor(x - 3 * strlen(params[i].name), y + (sinf(a) > 0.3f ? 10 : (sinf(a) < -0.3f ? -16 : -4)) + (cosf(a) > 0.5f ? 0 : 0));
     gfx->print(params[i].name);
   }
   Param &p = params[selParam];
   char buf[20];
-  gfx->setTextColor(RGB565_WHITE); gfx->setTextSize(2);
+  gfx->setTextColor(C_INK); gfx->setTextSize(2);
   gfx->setCursor(CX - 6 * strlen(p.name), CY - 40); gfx->print(p.name);
   gfx->setTextSize(4);
   snprintf(buf, sizeof(buf), *p.val < 10 && *p.val > -10 ? "%.2f" : "%.1f", *p.val);
   gfx->setCursor(CX - 12 * strlen(buf), CY - 12); gfx->print(buf);
-  gfx->setTextSize(1); gfx->setTextColor(gfx->color565(140, 140, 140));
+  gfx->setTextSize(1); gfx->setTextColor(C_INK_LT);
   gfx->setCursor(CX - 3 * strlen(p.unit), CY + 26); gfx->print(p.unit);
   gfx->setCursor(CX - 54, CY + 48); gfx->print("drag up/down  tap=next");
   if (wifiWanted) {
-    gfx->setCursor(CX - 45, CY + 66);
+    gfx->setCursor(CX - 42, CY + 62);
     if (WiFi.status() == WL_CONNECTED) gfx->print(WiFi.localIP().toString()); else gfx->print("wifi connecting...");
   }
   drawStatusDots(batteryV);
