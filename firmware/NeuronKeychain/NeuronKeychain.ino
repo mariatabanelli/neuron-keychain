@@ -1,5 +1,5 @@
 /*
-  Neuron keychain, firmware v0.3 (1-bit paper-and-ink look)
+  Neuron keychain, firmware v0.4 (deep sleep, wake on touch)
   Board : Waveshare ESP32-S3-Touch-LCD-1.28 (GC9A01 round 240x240, CST816S touch, QMI8658 IMU)
   Core  : esp32 by Espressif 3.1.x   Libs: GFX Library for Arduino (moononournation)
   Settings: ESP32S3 Dev Module, USB CDC On Boot Enabled, Flash 16MB, PSRAM QSPI, Partition 16M (3MB APP)
@@ -20,6 +20,8 @@
 #include "QMI8658.h"
 #include "secrets.h"
 #include "brain_bitmap.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 
 // ---------------- pins ----------------
 #define PIN_BL 2
@@ -39,6 +41,11 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(PIN_DC, PIN_CS, PIN_SCK, PIN_MOSI, P
 Arduino_GFX *panel = new Arduino_GC9A01(bus, PIN_RST, 0, true);
 Arduino_Canvas *gfx = new Arduino_Canvas(240, 240, panel);
 CST816S touch(TP_SDA, TP_SCL, TP_RST, TP_IRQ);
+
+// ---- palette (1-bit look: paper + ink) ----
+#define C_PAPER  (gfx->color565(196, 242, 176))   // pale mint
+#define C_INK    (gfx->color565(18, 24, 18))      // near black
+#define C_INK_LT (gfx->color565(110, 150, 100))   // dotted lines
 
 // ---------------- neuron ----------------
 float V_REST = -70.0f, V_THRESH = -55.0f, V_RESET = -75.0f;
@@ -70,6 +77,35 @@ Param params[] = {
 };
 const int N_PARAMS = sizeof(params) / sizeof(params[0]);
 int selParam = 0;
+
+// ---------------- sleep ----------------
+// Deep sleep after IDLE_MS with no touch, shake or OSC. Wake on touch (CST816S IRQ on GPIO 5, active low).
+// Spike count and parameters survive in RTC memory.
+const uint32_t IDLE_MS = 30000;
+const float V_LOW = 3.50f, V_CUTOFF = 3.30f;
+RTC_DATA_ATTR uint32_t rtcSpikes = 0;
+RTC_DATA_ATTR float rtcParams[6];
+RTC_DATA_ATTR bool rtcValid = false;
+uint32_t lastActivity = 0;
+
+void touchSetAutoSleep(bool on) {   // 0xFE: 0 = chip may auto-sleep (wakes on touch, raises IRQ), 1 = always on
+  Wire.beginTransmission(CST816S_ADDRESS); Wire.write(0xFE); Wire.write(on ? 0x00 : 0x01); Wire.endTransmission(true);
+}
+
+void goToSleep() {
+  rtcSpikes = spikeCount;
+  for (int i = 0; i < N_PARAMS; i++) rtcParams[i] = *params[i].val;
+  rtcValid = true;
+  gfx->fillScreen(C_PAPER); gfx->flush();
+  panel->displayOff();
+  digitalWrite(PIN_BL, LOW);
+  gpio_hold_en((gpio_num_t)PIN_BL); gpio_deep_sleep_hold_en();      // keep backlight off while asleep
+  touchSetAutoSleep(true);
+  delay(50);
+  rtc_gpio_pullup_en((gpio_num_t)TP_IRQ); rtc_gpio_pulldown_dis((gpio_num_t)TP_IRQ);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)TP_IRQ, 0);
+  esp_deep_sleep_start();
+}
 
 // ---------------- touch ----------------
 int screen = 0;                    // 0 home, 1 params
@@ -141,7 +177,7 @@ void oscReceive() {
     const uint8_t *arg = oscBuf + ap + tp;
     if (!strcmp(addr, "/neuron/current") && tags[1] == 'f') {
       uint32_t u = ((uint32_t)arg[0] << 24) | ((uint32_t)arg[1] << 16) | ((uint32_t)arg[2] << 8) | arg[3];
-      memcpy(&extCurrent, &u, 4); extCurrentUntil = millis() + 5000;
+      memcpy(&extCurrent, &u, 4); extCurrentUntil = millis() + 5000; lastActivity = millis();
       extHist[extHead] = extCurrent; extHead = (extHead + 1) % N_EXT; extHistValid = true;
     } else if (!strcmp(addr, "/neuron/stage")) {
       if (tags[1] == 's') { strncpy(stageLabel, (const char *)arg, 3); stageLabel[3] = 0; }
@@ -172,10 +208,6 @@ void stepModel(float iIn) {
 const int CX = 120, CY = 120;
 const float R_MIN = 62.0f, R_MAX = 108.0f;
 
-// ---- palette (1-bit look: paper + ink) ----
-#define C_PAPER  (gfx->color565(196, 242, 176))   // pale mint
-#define C_INK    (gfx->color565(18, 24, 18))      // near black
-#define C_INK_LT (gfx->color565(110, 150, 100))   // dotted lines
 
 
 // stippled line: draws every other pixel along the segment
@@ -191,7 +223,7 @@ void drawStatusDots(float batteryV) {
   char buf[16];
   gfx->setTextSize(1); gfx->setTextColor(C_INK_LT);
   gfx->setCursor(CX - 14, 44);
-  if (batteryV > 2.5f) { snprintf(buf, sizeof(buf), "%.2fV", batteryV); gfx->print(buf); } else gfx->print("USB");
+  if (batteryV > 2.5f) { snprintf(buf, sizeof(buf), batteryV < V_LOW ? "%.2fV low" : "%.2fV", batteryV); gfx->setCursor(batteryV < V_LOW ? CX - 26 : CX - 14, 44); gfx->print(buf); } else gfx->print("USB");
   if (wifiWanted) { if (WiFi.status() == WL_CONNECTED) gfx->fillCircle(CX + 30, 47, 2, C_INK); else gfx->drawCircle(CX + 30, 47, 2, C_INK_LT); }
   if (imuOk) gfx->fillCircle(CX - 30, 47, 2, C_INK_LT);
 }
@@ -291,7 +323,7 @@ void renderParams(float batteryV) {
   gfx->setCursor(CX - 12 * strlen(buf), CY - 12); gfx->print(buf);
   gfx->setTextSize(1); gfx->setTextColor(C_INK_LT);
   gfx->setCursor(CX - 3 * strlen(p.unit), CY + 26); gfx->print(p.unit);
-  gfx->setCursor(CX - 54, CY + 48); gfx->print("drag up/down  tap=next");
+  gfx->setCursor(CX - 54, CY + 48); gfx->print("drag=set tap=next hold=off");
   if (wifiWanted) {
     gfx->setCursor(CX - 42, CY + 62);
     if (WiFi.status() == WL_CONNECTED) gfx->print(WiFi.localIP().toString()); else gfx->print("wifi connecting...");
@@ -306,8 +338,10 @@ float readBattery() { uint32_t acc = 0; for (int i = 0; i < 8; i++) acc += analo
 uint32_t lastFrame = 0, lastBat = 0; float batteryV = 0;
 
 void setup() {
+  gpio_hold_dis((gpio_num_t)PIN_BL);
   pinMode(PIN_BL, OUTPUT); digitalWrite(PIN_BL, HIGH);
   Serial.begin(115200);
+  if (rtcValid) { spikeCount = rtcSpikes; for (int i = 0; i < N_PARAMS; i++) *params[i].val = rtcParams[i]; }
   for (int i = 0; i < N_TRACE; i++) trace[i] = V_REST;
   gfx->begin(); gfx->fillScreen(RGB565_BLACK); gfx->flush();
   touch.begin(); touchDisableAutoSleep();
@@ -317,6 +351,7 @@ void setup() {
   if (wifiWanted) { WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS); udp.begin(OSC_IN_PORT); }
   randomSeed(micros());
   lastFrame = millis();
+  lastActivity = millis();
 }
 
 void loop() {
@@ -328,6 +363,7 @@ void loop() {
     lastTouchPoll = now;
     bool down; int x, y;
     pollTouch(down, x, y);
+    if (down) lastActivity = now;
     if (down && !fingerDown) {                       // landed
       tx0 = x; ty0 = y; tyPrev = y; tDown = now; swipeDone = false; dragged = false;
       if (screen == 0) { tapUntil = tModel + TAP_MS; tapShownUntil = now + 300; }
@@ -352,7 +388,7 @@ void loop() {
 
   // ---- sensors / network ----
   readShake();
-  bool shaking = shake > 150.0f;            // measured: rest ~8, vigorous shake ~2000 (raw IMU scale, ~1340 per g)
+  bool shaking = shake > 150.0f; if (shaking) lastActivity = now;            // measured: rest ~8, vigorous shake ~2000 (raw IMU scale, ~1340 per g)
   if (wifiWanted) {
     static bool announced = false;
     if (WiFi.status() == WL_CONNECTED && !announced) { announced = true; Serial.print("IP "); Serial.println(WiFi.localIP()); }
@@ -374,6 +410,9 @@ void loop() {
   }
   flash *= 0.80f;
   if (now - lastBat > 2000) { lastBat = now; batteryV = readBattery(); }
+  if (screen == 1 && fingerDown && !dragged && !swipeDone && now - tDown > 3000) goToSleep();
+  if (now - lastActivity > IDLE_MS) goToSleep();
+  if (batteryV > 2.5f && batteryV < V_CUTOFF && now > 10000) goToSleep();
   if (wifiWanted) { oscSend("/neuron/v", v > V_THRESH ? 20.0f : v); if (spikeThisFrame) oscSend("/neuron/spike", 1.0f); }
 
   if (screen == 0) renderHome(batteryV, shaking); else renderParams(batteryV);
