@@ -1,5 +1,5 @@
 /*
-  Neuron keychain, firmware v0.4 (deep sleep, wake on touch)
+  Neuron keychain, firmware v0.5 (Hodgkin-Huxley model, switchable)
   Board : Waveshare ESP32-S3-Touch-LCD-1.28 (GC9A01 round 240x240, CST816S touch, QMI8658 IMU)
   Core  : esp32 by Espressif 3.1.x   Libs: GFX Library for Arduino (moononournation)
   Settings: ESP32S3 Dev Module, USB CDC On Boot Enabled, Flash 16MB, PSRAM QSPI, Partition 16M (3MB APP)
@@ -53,6 +53,17 @@ float TAU_M = 20.0f, R_M = 10.0f, T_REF = 2.0f;
 float I_HOLD = 2.0f, I_TAP = 8.0f, SHAKE_GAIN = 1.0f;
 const float DT = 0.1f, TAP_MS = 5.0f;
 
+// Hodgkin-Huxley (squid axon, 1952). Units: mV, ms, uA/cm^2, mS/cm^2. Same equations as hh_neuron.py.
+float MODEL = 0.0f;                 // 0 = leaky integrate-and-fire, 1 = Hodgkin-Huxley
+float G_NA = 120.0f, G_K = 36.0f, G_L = 0.3f;
+const float E_NA = 50.0f, E_K = -77.0f, E_L = -54.4f, C_M = 1.0f;
+const float DT_HH = 0.025f;         // ms; HH needs a fine step (spike is ~1 ms wide)
+const float HH_GAIN = 5.0f;         // nA on the touch scale -> uA/cm^2 (hold 2 -> 10, tap 8 -> 40)
+float hh_m = 0.053f, hh_h = 0.596f, hh_n = 0.318f;
+bool hhAbove = false;
+#define N_SCOPE 160                 // high-resolution window of the last 16 ms, for the spike shape
+float scope[N_SCOPE]; int scopeHead = 0; float sinceScope = 0;
+
 float v = -70.0f, refUntil = -1, tapUntil = -1, tModel = 0;
 uint32_t spikeCount = 0;
 float flash = 0;
@@ -68,13 +79,16 @@ float sinceSample = 0;
 // ---------------- parameters screen ----------------
 struct Param { const char *name; const char *unit; float *val; float step; float lo, hi; };
 Param params[] = {
-  { "TAU",   "ms",  &TAU_M,    0.5f,  2.0f,  100.0f },
+  { "Mode",  "",    &MODEL,    0.05f, 0.0f,  1.0f   },
   { "I",     "nA",  &I_HOLD,   0.05f, 0.0f,  6.0f   },
+  { "TAU",   "ms",  &TAU_M,    0.5f,  2.0f,  100.0f },
   { "Vth",   "mV",  &V_THRESH, 0.25f, -65.0f, -40.0f },
-  { "Vrst",  "mV",  &V_RESET,  0.25f, -90.0f, -60.0f },
-  { "R",     "MO",  &R_M,      0.25f, 2.0f,  30.0f  },
+  { "gNa",   "mS",  &G_NA,     1.0f,  0.0f,  240.0f },
+  { "gK",    "mS",  &G_K,      0.5f,  0.0f,  80.0f  },
+  { "gL",    "mS",  &G_L,      0.01f, 0.0f,  1.0f   },
   { "Tref",  "ms",  &T_REF,    0.1f,  0.0f,  10.0f  },
 };
+bool isHH() { return MODEL >= 0.5f; }
 const int N_PARAMS = sizeof(params) / sizeof(params[0]);
 int selParam = 0;
 
@@ -84,7 +98,7 @@ int selParam = 0;
 const uint32_t IDLE_MS = 30000;
 const float V_LOW = 3.50f, V_CUTOFF = 3.30f;
 RTC_DATA_ATTR uint32_t rtcSpikes = 0;
-RTC_DATA_ATTR float rtcParams[6];
+RTC_DATA_ATTR float rtcParams[8];
 RTC_DATA_ATTR bool rtcValid = false;
 uint32_t lastActivity = 0;
 
@@ -188,19 +202,51 @@ void oscReceive() {
 }
 
 // ---------------- model ----------------
+static inline float hh_am(float v) { float d = v + 40.0f; return fabsf(d) < 1e-4f ? 1.0f : 0.1f * d / (1.0f - expf(-d / 10.0f)); }
+static inline float hh_bm(float v) { return 4.0f * expf(-(v + 65.0f) / 18.0f); }
+static inline float hh_ah(float v) { return 0.07f * expf(-(v + 65.0f) / 20.0f); }
+static inline float hh_bh(float v) { return 1.0f / (1.0f + expf(-(v + 35.0f) / 10.0f)); }
+static inline float hh_an(float v) { float d = v + 55.0f; return fabsf(d) < 1e-4f ? 0.1f : 0.01f * d / (1.0f - expf(-d / 10.0f)); }
+static inline float hh_bn(float v) { return 0.125f * expf(-(v + 65.0f) / 80.0f); }
+
+void recordSamples(float dt, float peak) {
+  sinceSample += dt;
+  if (sinceSample >= TRACE_MS_PER_SAMPLE) {
+    sinceSample -= TRACE_MS_PER_SAMPLE;
+    trace[traceHead] = spikePending ? peak : v; spikePending = false;
+    traceHead = (traceHead + 1) % N_TRACE;
+  }
+  sinceScope += dt;
+  if (sinceScope >= 0.1f) { sinceScope -= 0.1f; scope[scopeHead] = v; scopeHead = (scopeHead + 1) % N_SCOPE; }
+}
+
+void stepHH(float iIn) {           // iIn in nA on the touch scale
+  float I = iIn * HH_GAIN;
+  tModel += DT_HH;
+  float i_na = G_NA * hh_m * hh_m * hh_m * hh_h * (v - E_NA);
+  float i_k  = G_K * hh_n * hh_n * hh_n * hh_n * (v - E_K);
+  float i_l  = G_L * (v - E_L);
+  float dv = (I - i_na - i_k - i_l) / C_M;
+  float am = hh_am(v), bm = hh_bm(v), ah = hh_ah(v), bh = hh_bh(v), an = hh_an(v), bn = hh_bn(v);
+  hh_m += (am * (1 - hh_m) - bm * hh_m) * DT_HH;
+  hh_h += (ah * (1 - hh_h) - bh * hh_h) * DT_HH;
+  hh_n += (an * (1 - hh_n) - bn * hh_n) * DT_HH;
+  v += dv * DT_HH;
+  if (v > 100.0f) v = 100.0f; if (v < -120.0f) v = -120.0f;
+  if (v > 0.0f && !hhAbove) { hhAbove = true; spikeCount++; flash = 1.0f; spikePending = true; spikeThisFrame = true; }
+  if (v < -20.0f) hhAbove = false;
+  recordSamples(DT_HH, 45.0f);
+}
+
 void stepModel(float iIn) {
+  if (isHH()) { stepHH(iIn); return; }
   tModel += DT;
   if (tModel < refUntil) v = V_RESET;
   else {
     v += ((-(v - V_REST) + R_M * iIn) / TAU_M) * DT;
     if (v >= V_THRESH) { v = 20.0f; spikeCount++; flash = 1.0f; spikePending = true; spikeThisFrame = true; refUntil = tModel + T_REF; }
   }
-  sinceSample += DT;
-  if (sinceSample >= TRACE_MS_PER_SAMPLE) {
-    sinceSample -= TRACE_MS_PER_SAMPLE;
-    trace[traceHead] = spikePending ? 20.0f : v; spikePending = false;
-    traceHead = (traceHead + 1) % N_TRACE;
-  }
+  recordSamples(DT, 20.0f);
   if (v > V_THRESH && tModel >= refUntil) v = V_RESET;
 }
 
@@ -215,7 +261,7 @@ void dotLine(float x0, float y0, float x1, float y1, uint16_t col, int phase) {
   float dx = x1 - x0, dy = y1 - y0; int n = (int)fmaxf(fabsf(dx), fabsf(dy)); if (n < 1) n = 1;
   for (int i = 0; i <= n; i++) if (((i + phase) & 1) == 0) gfx->drawPixel((int)(x0 + dx * i / n), (int)(y0 + dy * i / n), col);
 }
-float vToR(float mv) { float t = (mv - V_RESET) / (20.0f - V_RESET); if (t < 0) t = 0; if (t > 1) t = 1; return R_MIN + t * (R_MAX - R_MIN); }
+float vToR(float mv) { float lo = isHH() ? -80.0f : V_RESET, hi = isHH() ? 45.0f : 20.0f; float t = (mv - lo) / (hi - lo); if (t < 0) t = 0; if (t > 1) t = 1; return R_MIN + t * (R_MAX - R_MIN); }
 void drawDashedCircle(float r, uint16_t col) {   // dotted: one pixel every 3 degrees
   for (int a = 0; a < 360; a += 3) { float a0 = a * DEG_TO_RAD; gfx->drawPixel(CX + cosf(a0) * r, CY + sinf(a0) * r, col); }
 }
@@ -240,7 +286,7 @@ void renderHome(float batteryV, bool shaking) {
   }
 
   // rest baseline (faint) and threshold (dotted)
-  drawDashedCircle(vToR(V_THRESH), C_INK);
+  drawDashedCircle(vToR(isHH() ? -55.0f : V_THRESH), C_INK);
   float rRest = vToR(V_REST);
 
   // membrane trace as a halftone band: radial stipple from rest radius to the voltage, outline dot at the tip
@@ -250,7 +296,7 @@ void renderHome(float batteryV, bool shaking) {
     float r = vToR(trace[idx]);
     float ca = cosf(ang), sa = sinf(ang);
     float x = CX + ca * r, y = CY + sa * r;
-    bool spike = trace[idx] > V_THRESH;
+    bool spike = trace[idx] > (isHH() ? -20.0f : V_THRESH);
     int phase = (i + (int)(millis() / 120)) & 1;             // slow shimmer in the halftone
     if (spike) gfx->drawLine(CX + ca * rRest, CY + sa * rRest, x, y, C_INK);   // spikes solid
     else if (i > N_TRACE - 300) dotLine(CX + ca * rRest, CY + sa * rRest, x, y, C_INK, phase);  // newer part dense
@@ -263,13 +309,24 @@ void renderHome(float batteryV, bool shaking) {
   gfx->setTextColor(C_INK);
   if (!eegMode) {
     gfx->setTextSize(4);
-    snprintf(buf, sizeof(buf), "%d", (int)roundf(v > V_THRESH ? V_THRESH : v));
+    snprintf(buf, sizeof(buf), "%d", (int)roundf(isHH() ? v : (v > V_THRESH ? V_THRESH : v)));
     gfx->setCursor(CX - 12 * strlen(buf), CY - 26); gfx->print(buf);
     gfx->setTextSize(1);
     gfx->setCursor(CX - 6, CY + 8); gfx->print("mV");
     snprintf(buf, sizeof(buf), "spikes %lu", (unsigned long)spikeCount);
     gfx->setCursor(CX - 3 * strlen(buf), CY + 24); gfx->print(buf);
-    gfx->setCursor(CX - 15, CY + 60);
+    if (isHH()) {   // scope: last 16 ms at full resolution, so the spike's real shape is visible
+      int sx0 = CX - 40, sw = 80, sy = CY + 50, sh = 16;
+      float py = 0;
+      for (int i = 0; i < N_SCOPE; i++) {
+        float val = scope[(scopeHead + i) % N_SCOPE]; if (val < -80) val = -80; if (val > 45) val = 45;
+        float x = sx0 + (float)sw * i / (N_SCOPE - 1), y = sy - ((val + 80.0f) / 125.0f) * sh;
+        if (i > 0) gfx->drawLine(sx0 + (float)sw * (i - 1) / (N_SCOPE - 1), py, x, y, C_INK);
+        py = y;
+      }
+      gfx->setCursor(CX + 44, CY + 40); gfx->print("HH");
+    }
+    gfx->setCursor(CX - 15, isHH() ? CY + 70 : CY + 60);
     if (millis() < tapShownUntil && !fingerDown) gfx->print(" tap ");
     else if (fingerDown) gfx->print(" hold");
     else if (shaking) gfx->print("shake");
@@ -306,7 +363,7 @@ void renderParams(float batteryV) {
   drawDashedCircle(104, C_INK_LT);
   // six ticks around the ring, selected one bright
   for (int i = 0; i < N_PARAMS; i++) {
-    float a = (-90.0f + i * 60.0f) * DEG_TO_RAD;
+    float a = (-90.0f + i * (360.0f / N_PARAMS)) * DEG_TO_RAD;
     int x = CX + cosf(a) * 96, y = CY + sinf(a) * 96;
     bool sel = i == selParam;
     if (sel) gfx->fillCircle(x, y, 5, C_INK); else gfx->drawCircle(x, y, 3, C_INK);
@@ -319,7 +376,8 @@ void renderParams(float batteryV) {
   gfx->setTextColor(C_INK); gfx->setTextSize(2);
   gfx->setCursor(CX - 6 * strlen(p.name), CY - 40); gfx->print(p.name);
   gfx->setTextSize(4);
-  snprintf(buf, sizeof(buf), *p.val < 10 && *p.val > -10 ? "%.2f" : "%.1f", *p.val);
+  if (p.val == &MODEL) snprintf(buf, sizeof(buf), isHH() ? "HH" : "LIF");
+  else snprintf(buf, sizeof(buf), *p.val < 10 && *p.val > -10 ? "%.2f" : "%.1f", *p.val);
   gfx->setCursor(CX - 12 * strlen(buf), CY - 12); gfx->print(buf);
   gfx->setTextSize(1); gfx->setTextColor(C_INK_LT);
   gfx->setCursor(CX - 3 * strlen(p.unit), CY + 26); gfx->print(p.unit);
@@ -343,6 +401,7 @@ void setup() {
   Serial.begin(115200);
   if (rtcValid) { spikeCount = rtcSpikes; for (int i = 0; i < N_PARAMS; i++) *params[i].val = rtcParams[i]; }
   for (int i = 0; i < N_TRACE; i++) trace[i] = V_REST;
+  for (int i = 0; i < N_SCOPE; i++) scope[i] = -65.0f;
   gfx->begin(); gfx->fillScreen(RGB565_BLACK); gfx->flush();
   touch.begin(); touchDisableAutoSleep();
   imuOk = QMI8658_init() != 0;
@@ -398,7 +457,7 @@ void loop() {
 
   // ---- model ----
   uint32_t elapsed = now - lastFrame; if (elapsed > 50) elapsed = 50; lastFrame = now;
-  int steps = (int)(elapsed / DT);
+  int steps = (int)(elapsed / (isHH() ? DT_HH : DT));
   float sigma = shaking ? SHAKE_GAIN * shake / 600.0f : 0.0f; if (sigma > 3.0f) sigma = 3.0f;   // 600 -> 1 nA, 1800+ -> 3 nA
   spikeThisFrame = false;
   for (int s = 0; s < steps; s++) {
@@ -413,7 +472,7 @@ void loop() {
   if (screen == 1 && fingerDown && !dragged && !swipeDone && now - tDown > 3000) goToSleep();
   if (now - lastActivity > IDLE_MS) goToSleep();
   if (batteryV > 2.5f && batteryV < V_CUTOFF && now > 10000) goToSleep();
-  if (wifiWanted) { oscSend("/neuron/v", v > V_THRESH ? 20.0f : v); if (spikeThisFrame) oscSend("/neuron/spike", 1.0f); }
+  if (wifiWanted) { oscSend("/neuron/v", isHH() ? v : (v > V_THRESH ? 20.0f : v)); if (spikeThisFrame) oscSend("/neuron/spike", 1.0f); }
 
   if (screen == 0) renderHome(batteryV, shaking); else renderParams(batteryV);
   delay(16);
