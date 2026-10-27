@@ -4,3 +4,4 @@ __pycache__/
 *.csv
 .DS_Store
 firmware/**/secrets.h
+touchdesigner/Backup/
